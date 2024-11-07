@@ -1,0 +1,67 @@
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+# Build the container image
+- id: "build image"
+  name: "gcr.io/cloud-builders/docker"
+  args:
+    [
+      "build",
+      "-t",
+      "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_APP_NAME}:$COMMIT_SHA",
+      "-f",
+      "Dockerfile",
+      ".",
+    ]
+
+# Push the container image to Artifact Registry
+- id: "push image"
+  name: "gcr.io/cloud-builders/docker"
+  args:
+    [
+      "push",
+      "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_APP_NAME}:$COMMIT_SHA",
+    ]
+
+# Deploy container image to Cloud Run
+- id: "deploy to cloud run"
+  name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+  entrypoint: gcloud
+  args:
+    - "run"
+    - "deploy"
+    - "${_SERVICE_NAME}"
+    - "--image"
+    - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_APP_NAME}:$COMMIT_SHA"
+    - "--region"
+    - "${_REGION}"
+    - "--port=8080"
+    - "--project"
+    - "${PROJECT_ID}"
+    - "--service-account"
+    - "${_SERVICE_ACCOUNT}"
+    - "--execution-environment=gen2"
+    - "--allow-unauthenticated"
+    - "--set-env-vars"
+    - "OAUTH_USERNAME=${_OAUTH_USERNAME},OAUTH_PASSWORD=${_OAUTH_PASSWORD},BUCKET_NAME=${_BUCKET_NAME},ENDPOINT_URL=${_ENDPOINT_URL}"
+    - "--memory"
+    - "512Mi"
+    - "--cpu"
+    - "1"
+    - "--min-instances"
+    - "1"
+    - "--max-instances"
+    - "5"
+
+# Print the URL of the deployed service
+- id: "show service url"
+  name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+  entrypoint: sh
+  args:
+    - "-c"
+    - |
+      echo "Deployed service URL: $(gcloud run services describe ${_SERVICE_NAME} --region=${_REGION}--format='value(status.url)')"
+      echo "To view logs, run: gcloud run logs read --service=${_SERVICE_NAME} --region=${_REGION}"
+images:
+- "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_APP_NAME}:$COMMIT_SHA"
