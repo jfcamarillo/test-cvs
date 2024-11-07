@@ -88,4 +88,5 @@ async def process_data(input_data: ProcessDataInput):
 
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
