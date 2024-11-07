@@ -45,14 +45,37 @@ class ProcessDataInput(BaseModel):
         return v
 
 
+from google.api_core import retry
+import tenacity
+
+@retry.Retry(predicate=retry.if_exception_type(Exception))
+def upload_to_gcs_with_retry(blob, content):
+    blob.upload_from_string(content, content_type='application/json')
+
 async def upload_to_gcs(blob_name, content):
-    """Sube un archivo JSON a Google Cloud Storage de manera asíncrona."""
+    """Sube un archivo JSON a Google Cloud Storage de manera asíncrona con reintentos."""
     
     logging.info(f"Enviando {blob_name}")
     storage_client = storage.Client()
     blob = storage_client.bucket(BUCKET_NAME).blob(blob_name)
 
-    await asyncio.to_thread(blob.upload_from_string, content, content_type='application/json')
+    retry_strategy = tenacity.retry(
+        stop=tenacity.stop_after_attempt(5),
+        wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
+        retry=tenacity.retry_if_exception_type(Exception),
+        before=tenacity.before_log(logging.getLogger(), logging.INFO),
+        after=tenacity.after_log(logging.getLogger(), logging.INFO),
+    )
+
+    @retry_strategy
+    def upload_with_retry():
+        return asyncio.to_thread(upload_to_gcs_with_retry, blob, content)
+
+    try:
+        await upload_with_retry()
+    except Exception as e:
+        logging.error(f"Error al subir {blob_name} después de múltiples intentos: {str(e)}")
+        raise
 
 
 async def process_response(data):
@@ -86,23 +109,28 @@ async def process_data(input_data: ProcessDataInput):
     try:
         async with aiohttp.ClientSession() as session:
             skip = 0
+            semaphore = asyncio.Semaphore(input_data.concurrency_limit)
             while True:
-                tasks = [
-                    fetch_data(session, url.format(ENDPOINT_URL, url_complemento, skip + i * input_data.skip_increment, input_data.skip_increment, input_data.fecha_ini, input_data.fecha_fin))
-                    for i in range(input_data.concurrency_limit)
-                ]
+                tasks = []
+                for i in range(input_data.concurrency_limit):
+                    task = asyncio.create_task(
+                        fetch_and_process_data(
+                            session,
+                            semaphore,
+                            url.format(ENDPOINT_URL, url_complemento, skip + i * input_data.skip_increment, input_data.skip_increment, input_data.fecha_ini, input_data.fecha_fin)
+                        )
+                    )
+                    tasks.append(task)
                 skip += input_data.skip_increment * len(tasks)
 
-                try:
-                    responses = await asyncio.gather(*tasks)
-                except HTTPException as e:
-                    logging.error(f"Error en la solicitud HTTP: {e.detail}")
-                    return {"error": str(e.detail)}
-                
-                for data in responses:
-                    result = await process_response(data)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                if any(isinstance(result, Exception) for result in results):
+                    for result in results:
+                        if isinstance(result, Exception):
+                            logging.error(f"Error en la solicitud: {str(result)}")
+                    raise HTTPException(status_code=500, detail="Se produjeron errores durante el procesamiento")
 
-                if len(result) < input_data.skip_increment:
+                if any(len(result) < input_data.skip_increment for result in results if result is not None):
                     break
 
         logging.info("Procesamiento completado exitosamente")
@@ -110,6 +138,15 @@ async def process_data(input_data: ProcessDataInput):
     except Exception as e:
         logging.error(f"Error inesperado: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
+
+async def fetch_and_process_data(session, semaphore, url):
+    async with semaphore:
+        try:
+            data = await fetch_data(session, url)
+            return await process_response(data)
+        except Exception as e:
+            logging.error(f"Error en fetch_and_process_data: {str(e)}")
+            raise
 
 
 if __name__ == "__main__":
