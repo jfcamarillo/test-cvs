@@ -8,7 +8,8 @@ from pydantic import BaseModel, validator
 from datetime import datetime
 import uvicorn
 import logging
-
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from ssl import SSLError
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -45,10 +46,13 @@ class ProcessDataInput(BaseModel):
         return v
 
 
-from google.api_core import retry
-import tenacity
-
-@retry.Retry(predicate=retry.if_exception_type(Exception))
+@retry(
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=1, min=4, max=60),
+    retry=retry_if_exception_type((Exception, SSLError)),
+    before=lambda retry_state: logging.info(f"Intento {retry_state.attempt_number} de subir a GCS"),
+    after=lambda retry_state: logging.info(f"Intento {retry_state.attempt_number} completado")
+)
 def upload_to_gcs_with_retry(blob, content):
     blob.upload_from_string(content, content_type='application/json')
 
@@ -59,22 +63,12 @@ async def upload_to_gcs(blob_name, content):
     storage_client = storage.Client()
     blob = storage_client.bucket(BUCKET_NAME).blob(blob_name)
 
-    retry_strategy = tenacity.retry(
-        stop=tenacity.stop_after_attempt(5),
-        wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
-        retry=tenacity.retry_if_exception_type(Exception),
-        before=tenacity.before_log(logging.getLogger(), logging.INFO),
-        after=tenacity.after_log(logging.getLogger(), logging.INFO),
-    )
-
-    @retry_strategy
-    def upload_with_retry():
-        return asyncio.to_thread(upload_to_gcs_with_retry, blob, content)
-
     try:
-        await upload_with_retry()
+        await asyncio.to_thread(upload_to_gcs_with_retry, blob, content)
     except Exception as e:
         logging.error(f"Error al subir {blob_name} después de múltiples intentos: {str(e)}")
+        if isinstance(e, SSLError):
+            logging.error(f"Error SSL específico: {str(e)}")
         raise
 
 
